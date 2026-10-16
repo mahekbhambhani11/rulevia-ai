@@ -1,0 +1,22 @@
+# Secrets
+.env
+.env.*
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Node
+node_modules/
+
+# Build output
+dist/
+
+# Generated video data
+data/uploads/
+data/extracted_frames/
+data/review_records.json
+
+# Model weights
+*.pt
