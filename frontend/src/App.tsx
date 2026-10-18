@@ -1,5 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, type MouseEvent } from "react";
 import "./App.css";
+
+const API_BASE_URL = (
+  import.meta.env.VITE_API_BASE_URL ||
+  (import.meta.env.PROD ? "" : "http://127.0.0.1:8000")
+).replace(/\/+$/, "");
 
 type PageId =
   | "overview"
@@ -77,25 +82,15 @@ function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [selectedSafetyRule, setSelectedSafetyRule] =
     useState<SafetyRuleDraft | null>(null);
-  const testSafetyRule: SafetyRuleDraft = {
-    rule_name: "Person Detection Check",
-    description: "Check whether a person is present in the recorded video.",
-    hazard_type: "other",
-    detection_target: "person",
-    condition: "present",
-    severity: "medium",
-    required_evidence: ["person_detection", "timestamp", "bounding_box"],
-    recommended_action: "Review the detected person.",
-    confidence_threshold: 0.25,
-    limitations: ["Person detection does not prove a safety violation."],
-  };
+  const [videoResult, setVideoResult] = useState<VideoUploadResult | null>(null);
+  const [configuredZone, setConfiguredZone] = useState<ZonePoint[]>([]);
 
   useEffect(() => {
     let active = true;
 
     async function checkBackend() {
       try {
-        const response = await fetch("http://127.0.0.1:8000/health");
+        const response = await fetch(`${API_BASE_URL}/health`);
         if (!response.ok) throw new Error("Health check failed");
 
         if (active) setBackendStatus("connected");
@@ -254,7 +249,10 @@ function App() {
               onNavigate={navigateTo}
               selectedSafetyRule={selectedSafetyRule}
               onSelectSafetyRule={setSelectedSafetyRule}
-              testSafetyRule={testSafetyRule}
+              videoResult={videoResult}
+              onVideoResultChange={setVideoResult}
+              configuredZone={configuredZone}
+              onConfiguredZoneChange={setConfiguredZone}
             />
           )}
 
@@ -522,13 +520,88 @@ type SafetyRuleDraft = {
   description: string;
   hazard_type: string;
   detection_target: string;
+  detector_id?: string | null;
   condition: string;
+  condition_parameters?: Record<string, number | string | boolean>;
+  required_capability_types?: string[];
+  required_capabilities?: string[];
   severity: string;
   required_evidence: string[];
   recommended_action: string;
   confidence_threshold: number;
+  zone_overlap_threshold?: number | null;
   limitations: string[];
 };
+
+type DetectorCapabilities = {
+  targets: {
+    class_id: number;
+    class_name: string;
+    detector_id: string;
+    detector_name: string;
+    detector_behaviors: string[];
+  }[];
+  conditions: {
+    condition: string;
+    spatial: boolean;
+    required_target?: string;
+    parameter?: string;
+    required_capabilities?: string[];
+    required_capability_types?: string[];
+  }[];
+  behaviors: string[];
+  target_aliases: Record<string, string>;
+  capabilities: {
+    capability_id: string;
+    detector_id: string;
+    capability_type: string;
+    description: string;
+    supported_object_classes: string[];
+    supported_attributes: string[];
+    supported_states: string[];
+    supported_behaviours: string[];
+    supported_relationships: string[];
+    required_inputs: string[];
+    known_limitations: string[];
+    validation_status: "unvalidated" | "validated" | "production_ready";
+  }[];
+  limitations: string[];
+};
+
+type ZonePoint = {
+  x: number;
+  y: number;
+};
+
+function ruleRequiresZone(rule: SafetyRuleDraft): boolean {
+  const description = [
+    rule.rule_name,
+    rule.description,
+    rule.detection_target,
+    rule.condition,
+    ...rule.required_evidence,
+  ]
+    .join(" ")
+    .toLowerCase();
+
+  return (
+    rule.hazard_type === "restricted_area" ||
+    [
+      "restricted area",
+      "restricted zone",
+      "zone",
+      "boundary",
+      "enters the area",
+      "enters an area",
+      "entering",
+      "crossing",
+      "remaining within",
+      "spatial boundaries",
+      "inside the area",
+      "within the area",
+    ].some((term) => description.includes(term))
+  );
+}
 
 type RuleValidationResult = {
   status: "invalid" | "needs_configuration" | "ready_for_evaluation";
@@ -541,36 +614,122 @@ type RuleValidationResult = {
   }[];
 };
 
+type LiveFrameResult = {
+  status: string;
+  rule_name: string;
+  target_class: string;
+  detector_id: string;
+  condition: string;
+  timestamp_seconds: number;
+  frame_width: number;
+  frame_height: number;
+  condition_met: boolean;
+  evaluation_status: string;
+  human_approval_required: boolean;
+  detection_count: number;
+  detections: (DetectionMatch & {
+    class_id: number;
+    detector_id: string;
+    matches: boolean;
+    zone_overlap_ratio?: number;
+    zone_overlap_threshold?: number;
+  })[];
+  limitations: string[];
+};
+
 const exampleInstructions = [
-  "Alert when a person is detected without a hardhat.",
   "Flag people entering a restricted area.",
-  "Identify potential falls that require human review.",
+  "Flag a detected object that exhibits a registered unsafe state.",
 ];
+
+const supportedRestrictedAreaRule: SafetyRuleDraft = {
+  rule_name: "Person in Restricted Zone",
+  description:
+    "Flag sampled video frames where a detected person is present inside the configured restricted zone.",
+  hazard_type: "restricted_area",
+  detection_target: "person",
+  condition: "person_in_zone",
+  severity: "high",
+  required_evidence: ["person_detection", "restricted_zone", "timestamp"],
+  recommended_action: "Review the matching frame and confirm the event.",
+  confidence_threshold: 0.25,
+  limitations: [
+    "Evaluation checks sampled-frame zone presence; it does not detect continuous boundary crossing.",
+    "A detected person inside the zone is potential evidence and requires human review.",
+  ],
+};
+
+const supportedBoundingBoxOverlapRule: SafetyRuleDraft = {
+  ...supportedRestrictedAreaRule,
+  rule_name: "Person overlaps restricted zone",
+  description:
+    "Flag sampled frames where the configured fraction of a detected person's bounding box overlaps the restricted zone.",
+  condition: "person_overlaps_zone",
+  zone_overlap_threshold: 0.2,
+  limitations: [
+    "Overlap is polygon intersection area divided by person bounding-box area.",
+    "The configured ratio is a geometric candidate only and requires human review.",
+    "The detector's bounding box may be imprecise and does not identify body parts.",
+  ],
+};
 
 function RuleBuilder({
   onNavigate,
+  selectedSafetyRule,
   onSelectSafetyRule,
+  configuredZone,
 }: {
   onNavigate: (page: PageId) => void;
+  selectedSafetyRule: SafetyRuleDraft | null;
   onSelectSafetyRule: (rule: SafetyRuleDraft | null) => void;
+  configuredZone: ZonePoint[];
 }) {
   const [instruction, setInstruction] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [rule, setRule] = useState<SafetyRuleDraft | null>(null);
+  const [rule, setRule] = useState<SafetyRuleDraft | null>(selectedSafetyRule);
+  const [capabilities, setCapabilities] =
+    useState<DetectorCapabilities | null>(null);
+  const [capabilityError, setCapabilityError] = useState("");
 
   const [validation, setValidation] = useState<RuleValidationResult | null>(
     null,
   );
   const [validating, setValidating] = useState(false);
 
+  useEffect(() => {
+    let active = true;
+    fetch(`${API_BASE_URL}/capabilities`)
+      .then(async (response) => {
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.detail || "Unable to load detector capabilities.");
+        }
+        if (active) setCapabilities(data as DetectorCapabilities);
+      })
+      .catch((err: unknown) => {
+        if (active) {
+          setCapabilityError(
+            err instanceof Error
+              ? err.message
+              : "Unable to load detector capabilities.",
+          );
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
   async function generateRule() {
     setLoading(true);
     setError("");
     setRule(null);
+    setValidation(null);
+    onSelectSafetyRule(null);
 
     try {
-      const response = await fetch("http://127.0.0.1:8000/rules/generate", {
+      const response = await fetch(`${API_BASE_URL}/rules/generate`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -578,19 +737,26 @@ function RuleBuilder({
         body: JSON.stringify({ instruction }),
       });
 
-      const data = await response.json();
+      const data = await response.json().catch(() => ({}));
 
       if (!response.ok) {
-        throw new Error(data.detail || "Unable to generate a safety rule.");
+        throw new Error(
+          typeof data.detail === "string"
+            ? data.detail
+            : JSON.stringify(data.detail || "Unable to generate a safety rule."),
+        );
       }
 
-      setRule(data.rule);
-      onSelectSafetyRule(data.rule);
+      const generatedRule = data.rule as SafetyRuleDraft;
+      setRule(generatedRule);
+      onSelectSafetyRule(generatedRule);
     } catch (err) {
       setError(
-        err instanceof Error
-          ? err.message
-          : "Something went wrong. Check that the backend is running.",
+        err instanceof TypeError && err.message === "Failed to fetch"
+          ? `Could not reach the Rulevia backend at ${API_BASE_URL}. Check the backend URL, that the API is running, and that its CORS_ALLOWED_ORIGINS includes this frontend's origin. The restricted-area and overlap presets remain available without Gemini.`
+          : err instanceof Error
+            ? err.message
+            : "Unable to generate a rule. The restricted-area and overlap presets remain available.",
       );
     } finally {
       setLoading(false);
@@ -605,10 +771,13 @@ function RuleBuilder({
     setValidation(null);
 
     try {
-      const response = await fetch("http://127.0.0.1:8000/rules/validate", {
+      const response = await fetch(`${API_BASE_URL}/rules/validate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ rule }),
+        body: JSON.stringify({
+          rule,
+          zone: configuredZone.length >= 3 ? configuredZone : null,
+        }),
       });
 
       const data = await response.json();
@@ -625,6 +794,28 @@ function RuleBuilder({
     } finally {
       setValidating(false);
     }
+  }
+
+  function selectSupportedRestrictedAreaRule() {
+    const supportedRule = { ...supportedRestrictedAreaRule };
+    setInstruction(
+      "Flag sampled frames where a person is present inside the configured restricted zone.",
+    );
+    setRule(supportedRule);
+    setError("");
+    setValidation(null);
+    onSelectSafetyRule(supportedRule);
+  }
+
+  function selectSupportedBoundingBoxOverlapRule() {
+    const supportedRule = { ...supportedBoundingBoxOverlapRule };
+    setInstruction(
+      "Flag a person when the configured portion of their bounding box overlaps the restricted zone.",
+    );
+    setRule(supportedRule);
+    setError("");
+    setValidation(null);
+    onSelectSafetyRule(supportedRule);
   }
 
   return (
@@ -650,8 +841,13 @@ function RuleBuilder({
           id="safety-instruction"
           className="rule-textarea"
           value={instruction}
-          onChange={(event) => setInstruction(event.target.value)}
-          placeholder="Example: Alert me when a worker is detected without a hardhat in the manufacturing area..."
+          onChange={(event) => {
+            setInstruction(event.target.value);
+            setRule(null);
+            setValidation(null);
+            onSelectSafetyRule(null);
+          }}
+          placeholder="Describe an object, visual state, spatial condition, or behavior to look for..."
           maxLength={1000}
           rows={5}
         />
@@ -673,6 +869,7 @@ function RuleBuilder({
                   setError("");
                   setRule(null);
                   setValidation(null);
+                  onSelectSafetyRule(null);
                 }}
               >
                 {example}
@@ -681,10 +878,34 @@ function RuleBuilder({
           </div>
         </div>
 
+        <div className="rule-submit-row">
+          <span className="rule-security-note">
+            Uses supported person-in-zone evaluation; no AI generation required
+          </span>
+          <button
+            type="button"
+            className="secondary-button"
+            onClick={selectSupportedRestrictedAreaRule}
+          >
+            Use supported restricted-area rule
+          </button>
+          <button
+            type="button"
+            className="secondary-button"
+            onClick={selectSupportedBoundingBoxOverlapRule}
+          >
+            Use bounding-box overlap rule
+          </button>
+        </div>
+
         {error && (
           <div className="rule-error" role="alert">
-            <strong>Generation failed</strong>
+            <strong>Rule Builder notice</strong>
             <p>{error}</p>
+            <p>
+              Natural-language generation is separate from video evaluation;
+              the supported restricted-area and overlap presets remain usable.
+            </p>
           </div>
         )}
 
@@ -733,7 +954,7 @@ function RuleBuilder({
               </strong>
             </div>
             <div className="generated-field">
-              <span>Detection target</span>
+              <span>User-requested target</span>
               <strong>{rule.detection_target}</strong>
             </div>
             <div className="generated-field">
@@ -743,8 +964,270 @@ function RuleBuilder({
           </div>
 
           <div className="generated-section">
+            <h3>Detector capability</h3>
+            {capabilityError ? (
+              <p role="alert">{capabilityError}</p>
+            ) : !capabilities ? (
+              <p>Checking registered detector targets…</p>
+            ) : (
+              (() => {
+                const normalizedRequested = rule.detection_target
+                  .trim()
+                  .toLocaleLowerCase()
+                  .replaceAll("_", " ");
+                const canonicalRequested =
+                  capabilities.target_aliases[normalizedRequested] ??
+                  normalizedRequested;
+                const selectedTarget = capabilities.targets.find(
+                  (target) =>
+                    target.class_name.toLocaleLowerCase() === canonicalRequested &&
+                    (!rule.detector_id ||
+                      target.detector_id === rule.detector_id),
+                );
+                const eligibleConditions = capabilities.conditions.filter(
+                  (item) =>
+                    !item.required_target ||
+                    item.required_target === selectedTarget?.class_name,
+                );
+                const conditionCapability = capabilities.conditions.find(
+                  (item) => item.condition === rule.condition,
+                );
+                const supportedCondition =
+                  Boolean(conditionCapability) &&
+                  (!conditionCapability?.required_target ||
+                    conditionCapability.required_target ===
+                      selectedTarget?.class_name);
+                const registeredCapabilityTypes = new Set(
+                  capabilities.capabilities.map(
+                    (capability) => capability.capability_type,
+                  ),
+                );
+                const requestedCapabilityTypes =
+                  rule.required_capability_types ?? [];
+                const missingCapabilityTypes = requestedCapabilityTypes.filter(
+                  (type) => !registeredCapabilityTypes.has(type),
+                );
+                const requestedCapabilityIds = [
+                  ...new Set([
+                    ...(rule.required_capabilities ?? []),
+                    ...(conditionCapability?.required_capabilities ?? []),
+                  ]),
+                ];
+                const registeredCapabilityIds = new Set(
+                  capabilities.capabilities.map(
+                    (capability) => capability.capability_id,
+                  ),
+                );
+                const missingCapabilityIds = requestedCapabilityIds.filter(
+                  (id) => !registeredCapabilityIds.has(id),
+                );
+                return (
+                  <>
+                    <div className="generated-field">
+                      <span>Executable target</span>
+                      <strong>
+                        {selectedTarget
+                          ? `${selectedTarget.class_name} · ${selectedTarget.detector_name}`
+                          : "Not currently available"}
+                      </strong>
+                    </div>
+                    <label className="rule-field-label" htmlFor="detector-target">
+                      Choose an available detector target
+                    </label>
+                    <select
+                      id="detector-target"
+                      value={
+                        selectedTarget
+                          ? `${selectedTarget.detector_id}:${selectedTarget.class_id}`
+                          : ""
+                      }
+                      onChange={(event) => {
+                        const target = capabilities.targets.find(
+                          (item) =>
+                            `${item.detector_id}:${item.class_id}` ===
+                            event.target.value,
+                        );
+                        if (!target) return;
+                        const updatedRule = {
+                          ...rule,
+                          detection_target: target.class_name,
+                          detector_id: target.detector_id,
+                        };
+                        setRule(updatedRule);
+                        onSelectSafetyRule(updatedRule);
+                        setValidation(null);
+                      }}
+                    >
+                      <option value="">Keep requested target (not executable)</option>
+                      {capabilities.targets.map((target) => (
+                        <option
+                          key={`${target.detector_id}:${target.class_id}`}
+                          value={`${target.detector_id}:${target.class_id}`}
+                        >
+                          {target.class_name} — {target.detector_name}
+                        </option>
+                      ))}
+                    </select>
+                    <p>
+                      Condition: {supportedCondition ? "supported" : "unsupported"}.
+                      {" "}A language-model draft cannot add missing visual
+                      detection capabilities.
+                    </p>
+                    {requestedCapabilityTypes.length > 0 && (
+                      <div className="capability-requirements">
+                        <strong>Requested capability types</strong>
+                        <p>
+                          {requestedCapabilityTypes.join(", ")}
+                          {missingCapabilityTypes.length > 0
+                            ? ` · Missing: ${missingCapabilityTypes.join(", ")}`
+                            : " · Registered"}
+                        </p>
+                      </div>
+                    )}
+                    {requestedCapabilityIds.length > 0 && (
+                      <div className="capability-requirements">
+                        <strong>Requested capability contracts</strong>
+                        <p>
+                          {requestedCapabilityIds.join(", ")}
+                          {missingCapabilityIds.length > 0
+                            ? ` · Missing: ${missingCapabilityIds.join(", ")}`
+                            : " · Registered"}
+                        </p>
+                      </div>
+                    )}
+                    <details className="capability-catalog">
+                      <summary>Registered visual capability contracts</summary>
+                      {capabilities.capabilities.map((capability) => (
+                        <article
+                          className="capability-catalog-item"
+                          key={capability.capability_id}
+                        >
+                          <strong>
+                            {capability.capability_id} · {capability.capability_type}
+                          </strong>
+                          <span>
+                            {capability.validation_status.replaceAll("_", " ")}
+                          </span>
+                          <p>{capability.description}</p>
+                          {capability.supported_object_classes.length > 0 && (
+                            <p>
+                              Classes:{" "}
+                              {capability.supported_object_classes.join(", ")}
+                            </p>
+                          )}
+                          {(capability.supported_attributes.length > 0 ||
+                            capability.supported_states.length > 0 ||
+                            capability.supported_behaviours.length > 0 ||
+                            capability.supported_relationships.length > 0) && (
+                            <p>
+                              Attributes: {capability.supported_attributes.join(", ") || "none"} ·
+                              States: {capability.supported_states.join(", ") || "none"} ·
+                              Behaviours: {capability.supported_behaviours.join(", ") || "none"} ·
+                              Relationships: {capability.supported_relationships.join(", ") || "none"}
+                            </p>
+                          )}
+                          {capability.known_limitations.length > 0 && (
+                            <p>
+                              Limitations: {capability.known_limitations.join(" ")}
+                            </p>
+                          )}
+                        </article>
+                      ))}
+                    </details>
+                    <label className="rule-field-label" htmlFor="rule-condition">
+                      Evaluation condition
+                    </label>
+                    <select
+                      id="rule-condition"
+                      value={
+                        eligibleConditions.some(
+                          (item) => item.condition === rule.condition,
+                        )
+                          ? rule.condition
+                          : ""
+                      }
+                      onChange={(event) => {
+                        if (!event.target.value) return;
+                        const updatedRule = {
+                          ...rule,
+                          condition: event.target.value,
+                        };
+                        setRule(updatedRule);
+                        onSelectSafetyRule(updatedRule);
+                        setValidation(null);
+                      }}
+                    >
+                      <option value="">
+                        Keep requested condition (not currently executable)
+                      </option>
+                      {eligibleConditions.map((item) => (
+                        <option key={item.condition} value={item.condition}>
+                          {item.condition}
+                        </option>
+                      ))}
+                    </select>
+                  </>
+                );
+              })()
+            )}
+          </div>
+
+          <div className="generated-section">
             <h3>Trigger condition</h3>
-            <p>{rule.condition}</p>
+            <p>
+              {rule.condition === "person_in_zone"
+                ? "A detected person is present inside the configured restricted zone in a sampled frame."
+                : rule.condition === "person_overlaps_zone"
+                  ? "The polygon intersection area divided by the person's bounding-box area meets the configured threshold."
+                : rule.condition}
+            </p>
+            {[
+              "person_overlaps_zone",
+              "object_overlaps_zone",
+            ].includes(rule.condition) && (
+              <div className="generated-field">
+                <label htmlFor="zone-overlap-threshold">
+                  Minimum bounding-box overlap ratio (greater than 0, up to 1)
+                </label>
+                <input
+                  id="zone-overlap-threshold"
+                  type="number"
+                  min="0.01"
+                  max="1"
+                  step="0.01"
+                  value={
+                    rule.zone_overlap_threshold ??
+                    (typeof rule.condition_parameters?.overlap_threshold ===
+                      "number" ||
+                    typeof rule.condition_parameters?.overlap_threshold ===
+                      "string"
+                      ? rule.condition_parameters.overlap_threshold
+                      : "")
+                  }
+                  onChange={(event) => {
+                    const rawValue = event.target.value;
+                    const threshold =
+                      rawValue === "" ? undefined : Number(rawValue);
+                    const conditionParameters = {
+                      ...rule.condition_parameters,
+                    };
+                    if (threshold === undefined) {
+                      delete conditionParameters.overlap_threshold;
+                    } else {
+                      conditionParameters.overlap_threshold = threshold;
+                    }
+                    const updatedRule = {
+                      ...rule,
+                      zone_overlap_threshold: threshold,
+                      condition_parameters: conditionParameters,
+                    };
+                    setRule(updatedRule);
+                    onSelectSafetyRule(updatedRule);
+                    setValidation(null);
+                  }}
+                />
+              </div>
+            )}
           </div>
 
           <div className="generated-section">
@@ -828,6 +1311,8 @@ function RuleBuilder({
               onClick={() => {
                 setRule(null);
                 setError("");
+                setValidation(null);
+                onSelectSafetyRule(null);
               }}
             >
               Generate another draft
@@ -861,15 +1346,101 @@ type VideoUploadResult = {
   frames: ExtractedFrame[];
 };
 
+type DetectionMatch = {
+  class_name: string;
+  confidence: number;
+  box: [number, number, number, number];
+  anchor_point?: ZonePoint;
+  inside_zone?: boolean;
+};
+
+type EntryTransitionDiagnostic = {
+  detection_count: number;
+  observations: {
+    reference_point: ZonePoint;
+    inside_zone: boolean;
+  }[];
+  transition_evaluated: boolean;
+  transition_result: "entry_candidate" | "no_entry" | "not_evaluated";
+  reason: string;
+};
+
+type ZonePresenceDiagnostic = {
+  detection_count: number;
+  observations: {
+    reference_point: ZonePoint;
+    inside_zone: boolean;
+  }[];
+  matching_detection_count: number;
+  matching_status: boolean;
+};
+
+type ZoneOverlapDiagnostic = {
+  detection_count: number;
+  threshold: number;
+  observations: {
+    box: [number, number, number, number];
+    overlap_ratio: number;
+    matches: boolean;
+  }[];
+  matching_detection_count: number;
+  matching_status: boolean;
+};
+
+type EvaluatedFrame = {
+  frame: string;
+  timestamp_seconds: number;
+  frame_width: number;
+  frame_height: number;
+  target_observed: boolean;
+  zone_match: boolean | null;
+  zone_diagnostic: ZonePresenceDiagnostic | null;
+  overlap_diagnostic: ZoneOverlapDiagnostic | null;
+  entry_transition: EntryTransitionDiagnostic | null;
+  detections: DetectionMatch[];
+  matches: DetectionMatch[];
+};
+
+type VideoRuleEvaluationResult = {
+  status: string;
+  video_id: string;
+  rule_name: string;
+  target_class: string;
+  condition: string;
+  condition_met: boolean;
+  evaluation_status: string;
+  human_approval_required: boolean;
+  total_frames_evaluated: number;
+  frames_with_target: number;
+  frames_matching_condition: number;
+  zone: ZonePoint[] | null;
+  zone_overlap_threshold: number | null;
+  matching_frames: EvaluatedFrame[];
+  frame_results: EvaluatedFrame[];
+  limitations: string[];
+};
+
 function VideoLibrary({
   selectedSafetyRule,
+  result,
+  onVideoResultChange,
+  configuredZone,
+  onConfiguredZoneChange,
 }: {
   selectedSafetyRule: SafetyRuleDraft | null;
+  result: VideoUploadResult | null;
+  onVideoResultChange: (result: VideoUploadResult | null) => void;
+  configuredZone: ZonePoint[];
+  onConfiguredZoneChange: (zone: ZonePoint[]) => void;
 }) {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState("");
-  const [result, setResult] = useState<VideoUploadResult | null>(null);
+  const [zoneFrameNumber, setZoneFrameNumber] = useState<number | null>(
+    result?.frames[0]?.frame_number ?? null,
+  );
+  const [drawingZone, setDrawingZone] = useState(false);
+  const [draftZone, setDraftZone] = useState<ZonePoint[]>([]);
 
   const [reviewingFrame, setReviewingFrame] = useState("");
   const [reviewMessage, setReviewMessage] = useState("");
@@ -878,7 +1449,8 @@ function VideoLibrary({
 
   const [evaluating, setEvaluating] = useState(false);
   const [evaluationError, setEvaluationError] = useState("");
-  const [evaluationResult, setEvaluationResult] = useState<any>(null);
+  const [evaluationResult, setEvaluationResult] =
+    useState<VideoRuleEvaluationResult | null>(null);
 
   async function uploadVideo() {
     if (!selectedFile) {
@@ -888,14 +1460,15 @@ function VideoLibrary({
 
     setUploading(true);
     setError("");
-    setResult(null);
+    onVideoResultChange(null);
+    onConfiguredZoneChange([]);
 
     try {
       const formData = new FormData();
       formData.append("file", selectedFile);
 
       const response = await fetch(
-        "http://127.0.0.1:8000/videos/upload-extract",
+        `${API_BASE_URL}/videos/upload-extract`,
         {
           method: "POST",
           body: formData,
@@ -908,7 +1481,9 @@ function VideoLibrary({
         throw new Error(data.detail || "Video upload failed.");
       }
 
-      setResult(data as VideoUploadResult);
+      const uploadResult = data as VideoUploadResult;
+      onVideoResultChange(uploadResult);
+      setZoneFrameNumber(uploadResult.frames[0]?.frame_number ?? null);
     } catch (err) {
       setError(
         err instanceof Error
@@ -921,8 +1496,8 @@ function VideoLibrary({
   }
 
   async function submitReview(
-    frame: any,
-    match: any,
+    frame: EvaluatedFrame,
+    match: DetectionMatch,
     decision: "confirmed" | "dismissed" | "needs_further_review",
   ) {
     const reviewKey = `${frame.frame}-${decision}`;
@@ -933,7 +1508,7 @@ function VideoLibrary({
     setReviewError("");
 
     try {
-      const response = await fetch("http://127.0.0.1:8000/reviews", {
+      const response = await fetch(`${API_BASE_URL}/reviews`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -992,7 +1567,7 @@ function VideoLibrary({
 
     try {
       const response = await fetch(
-        "http://127.0.0.1:8000/rules/evaluate-video",
+        `${API_BASE_URL}/rules/evaluate-video`,
         {
           method: "POST",
           headers: {
@@ -1001,6 +1576,7 @@ function VideoLibrary({
           body: JSON.stringify({
             video_id: result.video_id,
             rule,
+            zone: configuredZone.length >= 3 ? configuredZone : null,
           }),
         },
       );
@@ -1015,7 +1591,7 @@ function VideoLibrary({
         );
       }
 
-      setEvaluationResult(data);
+      setEvaluationResult(data as VideoRuleEvaluationResult);
     } catch (err) {
       setEvaluationError(
         err instanceof Error
@@ -1037,6 +1613,31 @@ function VideoLibrary({
       remainingSeconds,
     ).padStart(2, "0")}`;
   }
+
+  function handleZoneDrawingClick(event: MouseEvent<SVGSVGElement>) {
+    if (!drawingZone) return;
+
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const point = {
+      x: Math.min(Math.max((event.clientX - bounds.left) / bounds.width, 0), 1),
+      y: Math.min(Math.max((event.clientY - bounds.top) / bounds.height, 0), 1),
+    };
+    const updatedZone = [...draftZone, point];
+    setDraftZone(updatedZone);
+  }
+
+  const zoneFrame =
+    result?.frames.find((frame) => frame.frame_number === zoneFrameNumber) ??
+    result?.frames[0] ??
+    null;
+  const spatialRule = selectedSafetyRule
+    ? ruleRequiresZone(selectedSafetyRule)
+    : false;
+  const evaluatedCondition = evaluationResult?.condition.trim().toLowerCase();
+  const pointsForDisplay = drawingZone ? draftZone : configuredZone;
+  const svgPoints = pointsForDisplay
+    .map((point) => `${point.x * 1000},${point.y * 1000}`)
+    .join(" ");
 
   return (
     <div className="video-library">
@@ -1062,7 +1663,10 @@ function VideoLibrary({
           accept=".mp4,.avi,.mov,.mkv,video/*"
           onChange={(event) => {
             setSelectedFile(event.target.files?.[0] ?? null);
-            setResult(null);
+            onVideoResultChange(null);
+            onConfiguredZoneChange([]);
+            setDraftZone([]);
+            setDrawingZone(false);
             setError("");
           }}
         />
@@ -1144,7 +1748,7 @@ function VideoLibrary({
                   key={frame.frame_number}
                 >
                   <img
-                    src={`http://127.0.0.1:8000${frame.image_url}`}
+                    src={`${API_BASE_URL}${frame.image_url}`}
                     alt={`Extracted frame at ${formatTimestamp(
                       frame.timestamp_seconds,
                     )}`}
@@ -1162,11 +1766,152 @@ function VideoLibrary({
             </div>
           </section>
 
+          <section className="panel zone-configuration-panel">
+            <div className="panel-heading">
+              <div>
+                <h3>Restricted-zone configuration</h3>
+                <p>
+                  Select a representative frame and mark the area to monitor.
+                  Coordinates are normalized to the video frame.
+                </p>
+              </div>
+              <span
+                className={`zone-status-pill ${
+                  configuredZone.length >= 3 ? "zone-status-ready" : ""
+                }`}
+              >
+                {drawingZone
+                  ? "Drawing zone"
+                  : configuredZone.length >= 3
+                    ? "Zone configured"
+                    : spatialRule
+                      ? "Required for this rule"
+                      : "Optional"}
+              </span>
+            </div>
+
+            <label className="rule-field-label" htmlFor="zone-reference-frame">
+              Reference frame
+            </label>
+            <select
+              id="zone-reference-frame"
+              className="zone-frame-select"
+              value={zoneFrameNumber ?? ""}
+              onChange={(event) =>
+                setZoneFrameNumber(
+                  event.target.value ? Number(event.target.value) : null,
+                )
+              }
+            >
+              {result.frames.map((frame) => (
+                <option key={frame.frame_number} value={frame.frame_number}>
+                  Frame {frame.frame_number} ·{" "}
+                  {formatTimestamp(frame.timestamp_seconds)}
+                </option>
+              ))}
+            </select>
+
+            {zoneFrame && (
+              <div className="zone-editor-stage">
+                <img
+                  src={`${API_BASE_URL}${zoneFrame.image_url}`}
+                  alt={`Zone reference frame ${zoneFrame.frame_number}`}
+                />
+                <svg
+                  className={`zone-drawing-overlay ${
+                    drawingZone ? "zone-drawing-active" : ""
+                  }`}
+                  viewBox="0 0 1000 1000"
+                  preserveAspectRatio="none"
+                  aria-label="Restricted-zone polygon editor"
+                  onClick={handleZoneDrawingClick}
+                >
+                  {pointsForDisplay.length >= 3 && !drawingZone && (
+                    <polygon points={svgPoints} className="zone-polygon" />
+                  )}
+                  {pointsForDisplay.length > 0 && (
+                    <polyline
+                      points={svgPoints}
+                      className="zone-polyline"
+                    />
+                  )}
+                  {pointsForDisplay.map((point, index) => (
+                    <circle
+                      key={`zone-point-${index}`}
+                      cx={point.x * 1000}
+                      cy={point.y * 1000}
+                      r="9"
+                      className="zone-vertex"
+                    />
+                  ))}
+                </svg>
+              </div>
+            )}
+
+            <p className="zone-editor-help">
+              {drawingZone
+                ? `Click the frame to add points (${draftZone.length} placed). Finish with at least 3 points.`
+                : configuredZone.length >= 3
+                  ? "A detection is considered in the zone when the bottom-center of its box lies inside the polygon."
+                  : "A restricted-area rule needs a polygon. A detection matches when the bottom-center of its box lies inside it."}
+            </p>
+            <div className="zone-editor-actions">
+              {drawingZone ? (
+                <>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => setDraftZone((points) => points.slice(0, -1))}
+                    disabled={draftZone.length === 0}
+                  >
+                    Undo last point
+                  </button>
+                  <button
+                    type="button"
+                    className="primary-button"
+                    onClick={() => {
+                      onConfiguredZoneChange(draftZone);
+                      setDrawingZone(false);
+                    }}
+                    disabled={draftZone.length < 3}
+                  >
+                    Finish zone
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => {
+                      setDraftZone([]);
+                      setDrawingZone(false);
+                    }}
+                  >
+                    Cancel
+                  </button>
+                </>
+              ) : (
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => {
+                    setDraftZone([]);
+                    setDrawingZone(true);
+                  }}
+                >
+                  {configuredZone.length >= 3 ? "Redraw zone" : "Draw zone"}
+                </button>
+              )}
+            </div>
+          </section>
+
           <section className="panel evaluation-panel">
             <div className="panel-heading">
               <div>
                 <h3>Safety Rule Evaluation</h3>
-                <p>Check whether a person is detected in this video.</p>
+                <p>
+                  {selectedSafetyRule
+                    ? `Evaluate “${selectedSafetyRule.rule_name}” against this video.`
+                    : "Generate a rule in Rule Builder before evaluating this video."}
+                </p>
               </div>
             </div>
 
@@ -1174,10 +1919,20 @@ function VideoLibrary({
               type="button"
               className="primary-button"
               onClick={evaluateSafetyRule}
-              disabled={evaluating}
+              disabled={
+                evaluating ||
+                !selectedSafetyRule ||
+                (spatialRule && configuredZone.length < 3)
+              }
             >
               {evaluating ? "Evaluating video..." : "Evaluate Safety Rule"}
             </button>
+
+            {spatialRule && configuredZone.length < 3 && (
+              <p className="stat-note">
+                Configure a restricted zone above to enable this spatial rule.
+              </p>
+            )}
 
             {evaluationError && (
               <p role="alert" className="error-message">
@@ -1191,6 +1946,10 @@ function VideoLibrary({
 
                 <p>
                   <strong>Rule:</strong> {evaluationResult.rule_name}
+                </p>
+
+                <p>
+                  <strong>Condition key:</strong> {evaluationResult.condition}
                 </p>
 
                 <p>
@@ -1209,15 +1968,232 @@ function VideoLibrary({
                 </p>
 
                 <p>
+                  <strong>Frames matching condition:</strong>{" "}
+                  {evaluationResult.frames_matching_condition}
+                </p>
+
+                <p>
                   <strong>Review status:</strong>{" "}
                   {evaluationResult.evaluation_status}
                 </p>
+
+                {evaluatedCondition === "person_in_zone" && (
+                  <>
+                    <h4>Zone Presence by Frame</h4>
+                    <div style={{ overflowX: "auto" }}>
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>Frame</th>
+                            <th>Timestamp</th>
+                            <th>People detected</th>
+                            <th>Reference point and zone result</th>
+                            <th>Matching detections</th>
+                            <th>Frame matches</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {evaluationResult.frame_results.map((frame) => {
+                            const diagnostic = frame.zone_diagnostic;
+                            return (
+                              <tr key={frame.frame}>
+                                <td>{frame.frame}</td>
+                                <td>
+                                  {formatTimestamp(frame.timestamp_seconds)}
+                                </td>
+                                <td>{diagnostic?.detection_count ?? 0}</td>
+                                <td>
+                                  {diagnostic?.observations.length
+                                    ? diagnostic.observations.map(
+                                        (observation, index) => (
+                                          <div key={`${frame.frame}-${index}`}>
+                                            (
+                                            {observation.reference_point.x.toFixed(
+                                              3,
+                                            )}
+                                            ,{" "}
+                                            {observation.reference_point.y.toFixed(
+                                              3,
+                                            )}
+                                            ){" "}
+                                            {observation.inside_zone
+                                              ? "inside"
+                                              : "outside"}
+                                          </div>
+                                        ),
+                                      )
+                                    : "No person detected"}
+                                </td>
+                                <td>
+                                  {diagnostic?.matching_detection_count ?? 0}
+                                </td>
+                                <td>
+                                  {diagnostic?.matching_status
+                                    ? "Yes"
+                                    : "No"}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </>
+                )}
+
+                {evaluatedCondition === "person_enters_zone" && (
+                  <>
+                    <h4>Entry Transition Diagnostics</h4>
+                    <div style={{ overflowX: "auto" }}>
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>Frame</th>
+                            <th>Timestamp</th>
+                            <th>People detected</th>
+                            <th>Reference point and zone result</th>
+                            <th>Transition evaluation</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {evaluationResult.frame_results.map((frame) => {
+                            const diagnostic = frame.entry_transition;
+                            return (
+                              <tr key={frame.frame}>
+                                <td>{frame.frame}</td>
+                                <td>
+                                  {formatTimestamp(frame.timestamp_seconds)}
+                                </td>
+                                <td>{diagnostic?.detection_count ?? 0}</td>
+                                <td>
+                                  {diagnostic?.observations.length
+                                    ? diagnostic.observations.map(
+                                        (observation, index) => (
+                                          <div key={`${frame.frame}-${index}`}>
+                                            (
+                                            {observation.reference_point.x.toFixed(
+                                              3,
+                                            )}
+                                            ,{" "}
+                                            {observation.reference_point.y.toFixed(
+                                              3,
+                                            )}
+                                            ){" "}
+                                            {observation.inside_zone
+                                              ? "inside"
+                                              : "outside"}
+                                          </div>
+                                        ),
+                                      )
+                                    : "No person detected"}
+                                </td>
+                                <td>
+                                  {diagnostic
+                                    ? `${diagnostic.transition_result.replaceAll(
+                                        "_",
+                                        " ",
+                                      )}: ${diagnostic.reason.replaceAll(
+                                        "_",
+                                        " ",
+                                      )}`
+                                    : "No entry diagnostics"}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </>
+                )}
+
+                {evaluatedCondition === "person_overlaps_zone" && (
+                  <>
+                    <h4>Bounding-Box / Zone Overlap by Frame</h4>
+                    <p>
+                      Match means polygon intersection area divided by
+                      bounding-box area is at least{" "}
+                      {evaluationResult.zone_overlap_threshold}.
+                    </p>
+                    <div style={{ overflowX: "auto" }}>
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>Frame</th>
+                            <th>Timestamp</th>
+                            <th>People detected</th>
+                            <th>Bounding box (x1, y1, x2, y2)</th>
+                            <th>Overlap ratio</th>
+                            <th>Threshold</th>
+                            <th>Detection matches</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {evaluationResult.frame_results.map((frame) => {
+                            const diagnostic = frame.overlap_diagnostic;
+                            return (
+                              <tr key={frame.frame}>
+                                <td>{frame.frame}</td>
+                                <td>
+                                  {formatTimestamp(frame.timestamp_seconds)}
+                                </td>
+                                <td>{diagnostic?.detection_count ?? 0}</td>
+                                <td>
+                                  {diagnostic?.observations.length
+                                    ? diagnostic.observations.map(
+                                        (observation, index) => (
+                                          <div key={`${frame.frame}-${index}`}>
+                                            {observation.box
+                                              .map((coordinate) =>
+                                                coordinate.toFixed(1),
+                                              )
+                                              .join(", ")}
+                                          </div>
+                                        ),
+                                      )
+                                    : "No person detected"}
+                                </td>
+                                <td>
+                                  {diagnostic?.observations.length
+                                    ? diagnostic.observations.map(
+                                        (observation, index) => (
+                                          <div key={`${frame.frame}-${index}`}>
+                                            {observation.overlap_ratio.toFixed(
+                                              3,
+                                            )}
+                                          </div>
+                                        ),
+                                      )
+                                    : "—"}
+                                </td>
+                                <td>
+                                  {diagnostic?.threshold.toFixed(3) ?? "—"}
+                                </td>
+                                <td>
+                                  {diagnostic?.observations.length
+                                    ? diagnostic.observations.map(
+                                        (observation, index) => (
+                                          <div key={`${frame.frame}-${index}`}>
+                                            {observation.matches ? "Yes" : "No"}
+                                          </div>
+                                        ),
+                                      )
+                                    : "No"}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </>
+                )}
 
                 <h4>Matching Frames</h4>
 
                 {evaluationResult.matching_frames?.length > 0 ? (
                   <div className="extracted-frames-grid">
-                    {evaluationResult.matching_frames.map((frame: any) => (
+                    {evaluationResult.matching_frames.map((frame) => (
                       <article
                         className="extracted-frame-card"
                         key={frame.frame}
@@ -1231,7 +2207,7 @@ function VideoLibrary({
                           }}
                         >
                           <img
-                            src={`http://127.0.0.1:8000/frames/${result.video_id}/${frame.frame}`}
+                            src={`${API_BASE_URL}/frames/${result.video_id}/${frame.frame}`}
                             alt={`Detected person at ${formatTimestamp(
                               frame.timestamp_seconds,
                             )}`}
@@ -1243,16 +2219,39 @@ function VideoLibrary({
                             }}
                           />
 
+                          {evaluationResult.zone && (
+                            <svg
+                              className="evidence-zone-overlay"
+                              viewBox="0 0 1000 1000"
+                              preserveAspectRatio="none"
+                              aria-hidden="true"
+                            >
+                              <polygon
+                                points={evaluationResult.zone
+                                  .map(
+                                    (point) =>
+                                      `${point.x * 1000},${point.y * 1000}`,
+                                  )
+                                  .join(" ")}
+                                className="evidence-zone-polygon"
+                              />
+                              {frame.matches.map(
+                                (match, index) =>
+                                  match.anchor_point && (
+                                    <circle
+                                      key={`anchor-${index}`}
+                                      cx={match.anchor_point.x * 1000}
+                                      cy={match.anchor_point.y * 1000}
+                                      r="10"
+                                      className="evidence-zone-anchor"
+                                    />
+                                  ),
+                              )}
+                            </svg>
+                          )}
+
                           {frame.matches
-                            .filter(
-                              (match: any, index: number, matches: any[]) =>
-                                index ===
-                                matches.findIndex(
-                                  (item: any) =>
-                                    item.class_name === match.class_name,
-                                ),
-                            )
-                            .map((match: any, index: number) => {
+                            .map((match, index) => {
                               const [x1, y1, x2, y2] = match.box;
                               const width = frame.frame_width;
                               const height = frame.frame_height;
@@ -1314,7 +2313,7 @@ function VideoLibrary({
                             {formatTimestamp(frame.timestamp_seconds)}
                           </span>
 
-                          {frame.matches.map((match: any, index: number) => (
+                          {frame.matches.map((match, index) => (
                             <div
                               key={`${frame.frame}-${index}`}
                               className="review-controls"
@@ -1406,7 +2405,7 @@ function ReviewQueue() {
 
     async function loadReviews() {
       try {
-        const response = await fetch("http://127.0.0.1:8000/reviews");
+        const response = await fetch(`${API_BASE_URL}/reviews`);
 
         if (!response.ok) {
           throw new Error("Failed to fetch review records.");
@@ -1523,7 +2522,7 @@ function AuditHistory() {
 
     async function loadAuditHistory() {
       try {
-        const response = await fetch("http://127.0.0.1:8000/reviews");
+        const response = await fetch(`${API_BASE_URL}/reviews`);
 
         if (!response.ok) {
           throw new Error("Failed to load audit history.");
@@ -1618,6 +2617,398 @@ function AuditHistory() {
   );
 }
 
+function LiveMonitoring({
+  selectedSafetyRule,
+  configuredZone,
+  onNavigate,
+}: {
+  selectedSafetyRule: SafetyRuleDraft | null;
+  configuredZone: ZonePoint[];
+  onNavigate: (page: PageId) => void;
+}) {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const requestRef = useRef<AbortController | null>(null);
+  const timeoutRef = useRef<number | null>(null);
+  const sessionIdRef = useRef(0);
+  const activeRef = useRef(false);
+  const startedAtRef = useRef(0);
+  const [starting, setStarting] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [error, setError] = useState("");
+  const [latestResult, setLatestResult] = useState<LiveFrameResult | null>(
+    null,
+  );
+
+  function releaseSession() {
+    sessionIdRef.current += 1;
+    activeRef.current = false;
+    if (timeoutRef.current !== null) {
+      window.clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+    }
+    requestRef.current?.abort();
+    requestRef.current = null;
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+    if (videoRef.current) videoRef.current.srcObject = null;
+  }
+
+  useEffect(
+    () => () => {
+      sessionIdRef.current += 1;
+      activeRef.current = false;
+      if (timeoutRef.current !== null) {
+        window.clearTimeout(timeoutRef.current);
+      }
+      requestRef.current?.abort();
+      streamRef.current?.getTracks().forEach((track) => track.stop());
+      if (videoRef.current) videoRef.current.srcObject = null;
+    },
+    [],
+  );
+
+  function stopMonitoring() {
+    releaseSession();
+    setStarting(false);
+    setRunning(false);
+  }
+
+  function readableCameraError(reason: unknown) {
+    if (reason instanceof DOMException) {
+      if (reason.name === "NotAllowedError" || reason.name === "SecurityError") {
+        return "Camera permission was denied. Allow camera access in your browser settings, then try again.";
+      }
+      if (reason.name === "NotFoundError" || reason.name === "DevicesNotFoundError") {
+        return "No camera is available. Connect or enable a webcam and try again.";
+      }
+      if (reason.name === "NotReadableError" || reason.name === "TrackStartError") {
+        return "The camera could not be started. It may be in use by another application.";
+      }
+    }
+    return reason instanceof Error
+      ? reason.message
+      : "Unable to start webcam monitoring.";
+  }
+
+  async function captureAndEvaluate(sessionId: number) {
+    if (!activeRef.current || sessionIdRef.current !== sessionId) return;
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    if (!video || !canvas || video.videoWidth <= 0 || video.videoHeight <= 0) {
+      setError("The webcam has not produced a usable frame yet.");
+      stopMonitoring();
+      return;
+    }
+
+    const scale = Math.min(
+      640 / video.videoWidth,
+      640 / video.videoHeight,
+      1,
+    );
+    canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+    canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+    const context = canvas.getContext("2d");
+    if (!context) {
+      setError("This browser could not prepare a webcam frame for inference.");
+      stopMonitoring();
+      return;
+    }
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    try {
+      const blob = await new Promise<Blob | null>((resolve) =>
+        canvas.toBlob(resolve, "image/jpeg", 0.75),
+      );
+      if (!blob) throw new Error("Unable to encode a webcam frame.");
+      if (!activeRef.current || sessionIdRef.current !== sessionId) return;
+
+      const formData = new FormData();
+      formData.append("file", blob, "webcam-frame.jpg");
+      formData.append("rule", JSON.stringify(selectedSafetyRule));
+      if (configuredZone.length >= 3) {
+        formData.append("zone", JSON.stringify(configuredZone));
+      }
+      formData.append(
+        "timestamp_seconds",
+        String((performance.now() - startedAtRef.current) / 1000),
+      );
+
+      const controller = new AbortController();
+      requestRef.current = controller;
+      const response = await fetch(`${API_BASE_URL}/rules/evaluate-frame`, {
+        method: "POST",
+        body: formData,
+        signal: controller.signal,
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(
+          typeof data.detail === "string"
+            ? data.detail
+            : JSON.stringify(data.detail || "Live frame evaluation failed."),
+        );
+      }
+      if (!activeRef.current || sessionIdRef.current !== sessionId) return;
+      setLatestResult(data as LiveFrameResult);
+      setError("");
+      requestRef.current = null;
+      timeoutRef.current = window.setTimeout(
+        () => void captureAndEvaluate(sessionId),
+        1500,
+      );
+    } catch (reason) {
+      if (
+        reason instanceof DOMException &&
+        reason.name === "AbortError"
+      ) {
+        return;
+      }
+      if (sessionIdRef.current !== sessionId) return;
+      setError(
+        reason instanceof TypeError && reason.message === "Failed to fetch"
+          ? `Could not reach the Rulevia backend at ${API_BASE_URL}. Check the backend URL and CORS configuration.`
+          : reason instanceof Error
+            ? reason.message
+            : "Live frame evaluation failed.",
+      );
+      stopMonitoring();
+    }
+  }
+
+  async function startMonitoring() {
+    if (starting || running) return;
+    setError("");
+    setLatestResult(null);
+    if (!selectedSafetyRule) {
+      setError("Choose a safety rule in Rule Builder before starting monitoring.");
+      return;
+    }
+    if (selectedSafetyRule.condition.includes("enters_zone")) {
+      setError(
+        "Entry rules need adjacent observations and are not supported by single-frame live monitoring. Select a presence or overlap rule.",
+      );
+      return;
+    }
+    if (!window.isSecureContext) {
+      setError(
+        "Webcam access requires a secure browser context. Use localhost or HTTPS.",
+      );
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setError("This browser does not provide webcam access.");
+      return;
+    }
+
+    const sessionId = ++sessionIdRef.current;
+    setStarting(true);
+    try {
+      const validationController = new AbortController();
+      requestRef.current = validationController;
+      const validationResponse = await fetch(`${API_BASE_URL}/rules/validate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          rule: selectedSafetyRule,
+          zone: configuredZone.length >= 3 ? configuredZone : null,
+        }),
+        signal: validationController.signal,
+      });
+      const validation = (await validationResponse.json().catch(() => ({}))) as
+        | RuleValidationResult
+        | { detail?: string };
+      if (sessionIdRef.current !== sessionId) return;
+      requestRef.current = null;
+      if (!validationResponse.ok) {
+        throw new Error(
+          "detail" in validation && typeof validation.detail === "string"
+            ? validation.detail
+            : "Rule validation failed.",
+        );
+      }
+      if (
+        !("status" in validation) ||
+        validation.status !== "ready_for_evaluation"
+      ) {
+        const details =
+          "findings" in validation
+            ? validation.findings
+                .filter((finding) => finding.status !== "passed")
+                .map((finding) => finding.message)
+                .join(" ")
+            : "";
+        throw new Error(
+          details || "Validate and configure the selected rule before monitoring.",
+        );
+      }
+      if (sessionIdRef.current !== sessionId) return;
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: "user",
+          width: { ideal: 640 },
+          height: { ideal: 480 },
+        },
+        audio: false,
+      });
+      if (sessionIdRef.current !== sessionId) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      streamRef.current = stream;
+      if (!videoRef.current) {
+        throw new Error("Webcam preview is unavailable.");
+      }
+      videoRef.current.srcObject = stream;
+      await videoRef.current.play();
+      if (sessionIdRef.current !== sessionId) return;
+      startedAtRef.current = performance.now();
+      activeRef.current = true;
+      setRunning(true);
+      void captureAndEvaluate(sessionId);
+    } catch (reason) {
+      if (sessionIdRef.current === sessionId) {
+        setError(
+          reason instanceof TypeError && reason.message === "Failed to fetch"
+            ? `Could not reach the Rulevia backend at ${API_BASE_URL}. Check the backend URL and CORS configuration.`
+            : readableCameraError(reason),
+        );
+        setStarting(false);
+        setRunning(false);
+        releaseSession();
+      }
+    } finally {
+      if (sessionIdRef.current === sessionId) setStarting(false);
+    }
+  }
+
+  const zoneRequired = selectedSafetyRule
+    ? ruleRequiresZone(selectedSafetyRule)
+    : false;
+
+  return (
+    <section className="live-monitor-page">
+      <div className="panel live-monitor-controls">
+        <div>
+          <span className="rule-step-label">LOCAL WEBCAM MONITORING</span>
+          <h2>{selectedSafetyRule?.rule_name ?? "No rule selected"}</h2>
+          <p>
+            {selectedSafetyRule
+              ? `${selectedSafetyRule.detection_target} · ${selectedSafetyRule.condition}`
+              : "Select and validate a rule in Rule Builder to begin."}
+          </p>
+          {zoneRequired && (
+            <p>
+              {configuredZone.length >= 3
+                ? `Restricted zone configured (${configuredZone.length} points).`
+                : "This spatial rule requires a zone configured in Video Library."}
+            </p>
+          )}
+        </div>
+        <div className="live-monitor-actions">
+          <button
+            className="primary-button"
+            onClick={() => void startMonitoring()}
+            disabled={starting || running}
+          >
+            {starting ? "Starting…" : "Start Monitoring"}
+          </button>
+          <button
+            className="secondary-button"
+            onClick={stopMonitoring}
+            disabled={!starting && !running}
+          >
+            Stop Monitoring
+          </button>
+          {!selectedSafetyRule && (
+            <button
+              className="secondary-button"
+              onClick={() => onNavigate("rules")}
+            >
+              Open Rule Builder
+            </button>
+          )}
+        </div>
+      </div>
+
+      {error && (
+        <p className="live-monitor-error" role="alert">
+          {error}
+        </p>
+      )}
+
+      <div className="live-monitor-layout">
+        <div className="panel live-monitor-preview">
+          <div className="panel-heading">
+            <h3>Webcam preview</h3>
+            <span className="neutral-pill">
+              {running ? "Monitoring" : starting ? "Starting" : "Stopped"}
+            </span>
+          </div>
+          <video ref={videoRef} autoPlay playsInline muted />
+          <canvas ref={canvasRef} className="live-monitor-canvas" />
+          <p>
+            Frames are sampled every 1.5 seconds and are not stored. Stop
+            Monitoring releases the camera.
+          </p>
+        </div>
+
+        <div className="panel live-monitor-results">
+          <div className="panel-heading">
+            <h3>Latest evaluation</h3>
+            {latestResult && (
+              <span className="neutral-pill">
+                {latestResult.condition_met ? "Potential match" : "No match"}
+              </span>
+            )}
+          </div>
+          {!latestResult ? (
+            <p>
+              Start monitoring to see target detections and per-frame rule
+              diagnostics.
+            </p>
+          ) : (
+            <>
+              <p>
+                {latestResult.rule_name} · {latestResult.target_class} ·{" "}
+                {latestResult.condition}
+              </p>
+              <p>
+                Frame {latestResult.frame_width}×{latestResult.frame_height} ·
+                {" "}session time {latestResult.timestamp_seconds.toFixed(1)}s ·{" "}
+                {latestResult.detection_count} target detection(s)
+              </p>
+              <ul className="live-detection-list">
+                {latestResult.detections.length === 0 ? (
+                  <li>No target detections in this frame.</li>
+                ) : (
+                  latestResult.detections.map((detection, index) => (
+                    <li key={`${detection.class_id}-${index}`}>
+                      <strong>{detection.class_name}</strong>
+                      {" "}· {(detection.confidence * 100).toFixed(1)}%
+                      {" "}· {detection.matches ? "matches" : "does not match"}
+                      {detection.inside_zone !== undefined &&
+                        ` · bottom-center ${detection.inside_zone ? "inside" : "outside"} zone`}
+                      {detection.zone_overlap_ratio !== undefined &&
+                        ` · overlap ${(detection.zone_overlap_ratio * 100).toFixed(1)}%`}
+                    </li>
+                  ))
+                )}
+              </ul>
+              <p>
+                Potential detections require human review; live frames are
+                transient and are not added to Review Queue or Audit History.
+              </p>
+            </>
+          )}
+        </div>
+      </div>
+    </section>
+  );
+}
+
 const featureDetails: Record<
   Exclude<PageId, "overview">,
   {
@@ -1640,7 +3031,7 @@ const featureDetails: Record<
     icon: "⌘",
     heading: "Your rule builder is coming together",
     description:
-      "You will describe requirements such as “Alert me when a person enters the restricted zone without a hardhat.” Rulevia will turn the instruction into a structured rule for validation.",
+      "Describe a visual safety requirement in plain language. Rulevia will turn it into a structured request and check it against registered detector and evaluation capabilities.",
     next: "Explore the video library",
     target: "videos",
   },
@@ -1699,27 +3090,50 @@ function FeaturePage({
   onNavigate,
   selectedSafetyRule,
   onSelectSafetyRule,
-  testSafetyRule,
+  videoResult,
+  onVideoResultChange,
+  configuredZone,
+  onConfiguredZoneChange,
 }: {
   page: Exclude<PageId, "overview">;
   onNavigate: (page: PageId) => void;
   selectedSafetyRule: SafetyRuleDraft | null;
   onSelectSafetyRule: (rule: SafetyRuleDraft | null) => void;
-  testSafetyRule: SafetyRuleDraft;
+  videoResult: VideoUploadResult | null;
+  onVideoResultChange: (result: VideoUploadResult | null) => void;
+  configuredZone: ZonePoint[];
+  onConfiguredZoneChange: (zone: ZonePoint[]) => void;
 }) {
-  // Show the real Rule Builder instead of the placeholder.
+  if (page === "live") {
+    return (
+      <LiveMonitoring
+        selectedSafetyRule={selectedSafetyRule}
+        configuredZone={configuredZone}
+        onNavigate={onNavigate}
+      />
+    );
+  }
+
   if (page === "rules") {
     return (
       <RuleBuilder
         onNavigate={onNavigate}
+        selectedSafetyRule={selectedSafetyRule}
         onSelectSafetyRule={onSelectSafetyRule}
+        configuredZone={configuredZone}
       />
     );
   }
 
   if (page === "videos") {
     return (
-      <VideoLibrary selectedSafetyRule={selectedSafetyRule ?? testSafetyRule} />
+      <VideoLibrary
+        selectedSafetyRule={selectedSafetyRule}
+        result={videoResult}
+        onVideoResultChange={onVideoResultChange}
+        configuredZone={configuredZone}
+        onConfiguredZoneChange={onConfiguredZoneChange}
+      />
     );
   }
 

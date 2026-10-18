@@ -1,6 +1,7 @@
 # Secrets
 .env
 .env.*
+!.env.example
 
 # Python
 .venv/
@@ -20,3 +21,19 @@ data/review_records.json
 
 # Model weights
 *.pt
+!backend/yolo11n.pt
+# Local Firebase state
+frontend/.firebase/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Python and generated data
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
+backend/data/
+backend/uploads/
